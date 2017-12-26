@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	message "github.com/chadit/MessageQueueExamples/nats-streaming/message"
@@ -42,19 +43,26 @@ var (
 	ErrInvalidSubject = errors.New("na: invalid subject")
 	// ErrRequestTimeout indicates that a request call timed out
 	ErrRequestTimeout = errors.New("na: request timeout")
+	// ErrConnectionClosed indicates that the nats connection was closed
+	ErrConnectionClosed = errors.New("na: connection was closed")
 )
+
+// ConnHandler is used for asynchronous events such as
+// disconnected and closed connections.
+type ConnHandler func(*T)
 
 // T holds all properties necessary for pub-sub queue message transmissions.
 type T struct {
-	ClusterID   *string        // id of the node
-	ClientID    *string        //clientID can contain only alphanumeric and `-` or `_` characters.
-	Crypto      *string        // key used by the conrypto package
-	Timeout     *time.Duration // maximum amount of time to wait before aborting a request
-	URLList     *string        // NATS connection URL
-	connection  stan.Conn      // connection to the NATS server
-	crypto      *crypto1.T     // handles cryptography concerns
-	QueueName   string         // NATS queue name, which ensures at-most-once-per-service message delivery
-	initialized bool           // indicates whether initialization has occurred
+	ClusterID     *string        // id of the node
+	ClientID      *string        //clientID can contain only alphanumeric and `-` or `_` characters.
+	Crypto        *string        // key used by the conrypto package
+	Timeout       *time.Duration // maximum amount of time to wait before aborting a request
+	URLList       *string        // NATS connection URL
+	connection    stan.Conn      // connection to the NATS server
+	ClosedHandler ConnHandler    // Handler for closed connection events
+	crypto        *crypto1.T     // handles cryptography concerns
+	QueueName     string         // NATS queue name, which ensures at-most-once-per-service message delivery
+	initialized   bool           // indicates whether initialization has occurred
 
 }
 
@@ -103,11 +111,7 @@ func (t *T) Initialize() error {
 	nu := strings.Split(*t.URLList, ",")
 	t.connection, err = stan.Connect(*t.ClusterID, *t.ClientID, stan.NatsURL(nu[0]), stan.ConnectWait(*t.Timeout))
 	if err != nil {
-		switch err.Error() {
-		case "stan: clientID already registered":
-			return ErrClientIDNotUnique
-		}
-		return err
+		return t.errorHandler("init", err)
 	}
 
 	t.QueueName = os.Args[0]
@@ -120,7 +124,7 @@ func (t *T) Initialize() error {
 }
 
 // Request - serial calls - when the request is made, the thread will wait for a response or timeout
-func (t T) Request(m, p *message.Msg) error {
+func (t *T) Request(m, p *message.Msg) error {
 	if !t.initialized {
 		return ErrNotInitialized
 	}
@@ -131,47 +135,48 @@ func (t T) Request(m, p *message.Msg) error {
 	)
 	wg.Add(1)
 	m.Reply = uuid.NewV4().String()
+	var completed int32 = 1
 
 	h := func(mr []byte) {
+		atomic.AddInt32(&completed, -1)
 		t.Decode(mr, p)
 		wg.Done()
 	}
 
 	sHandler, err := t.rawSubscribe(Subscription{Subject: m.Reply, QueueName: "request"}, h)
 	if err != nil {
-		return err
+		return t.errorHandler(m.Reply, err)
 	}
 
 	err = t.Publish(m)
 	if err != nil {
-		closeHandler(sHandler)
+		t.CloseHandler(sHandler)
 		return err
 	}
 
 	// timeout handler
-	go func() {
+
+	go func(completed *int32) {
 		td := time.Duration(time.Second * 300)
 		if t.Timeout != nil {
 			td = *t.Timeout
 		}
 
-		time.Sleep(td)
-		err = ErrRequestTimeout
-		wg.Done()
-	}()
+		<-time.After(td)
+		if completed != nil && *completed != 0 {
+			atomic.AddInt32(completed, -1)
+			err = ErrRequestTimeout
+			wg.Done()
+		}
+	}(&completed)
 
 	wg.Wait()
-	closeHandler(sHandler)
+	t.CloseHandler(sHandler)
 	return err
 }
 
-func closeHandler(sHandler stan.Subscription) {
-	sHandler.Unsubscribe()
-	sHandler.Close()
-}
-
 // Publish puts a given message into the queue.
-func (t T) Publish(m *message.Msg) error {
+func (t *T) Publish(m *message.Msg) error {
 	if !t.initialized {
 		return ErrNotInitialized
 	}
@@ -185,11 +190,11 @@ func (t T) Publish(m *message.Msg) error {
 	if err != nil {
 		return err
 	}
-	return t.connection.Publish(subj, data)
+	return t.errorHandler(subj, t.connection.Publish(subj, data))
 }
 
 // Subscribe registers a handler to be called in response to messages being received from the queue.
-func (t T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription, error) {
+func (t *T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription, error) {
 	if !t.initialized {
 		return nil, ErrNotInitialized
 	}
@@ -208,6 +213,9 @@ func (t T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription,
 	}
 
 	process := func(ms *stan.Msg) {
+		if sub.DurableName != "" {
+			ms.Ack()
+		}
 		m := new(message.Msg)
 		err := t.Decode(ms.Data, m)
 		if err != nil {
@@ -227,6 +235,7 @@ func (t T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription,
 
 	if sub.DurableName != "" {
 		options = append(options, stan.DurableName(sub.DurableName))
+		options = append(options, stan.SetManualAckMode())
 	}
 
 	if sub.Sequence != 0 {
@@ -239,14 +248,11 @@ func (t T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription,
 		subHandler, err = t.connection.QueueSubscribe(subj, sub.QueueName, process, options...)
 	}
 
-	if err != nil {
-		return nil, err
-	}
-	return subHandler, nil
+	return subHandler, t.errorHandler(subj, err)
 }
 
 // rawHandler registers a handler to be called in response to messages being received from the queue.
-func (t T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, error) {
+func (t *T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, error) {
 	if !t.initialized {
 		return nil, ErrNotInitialized
 	}
@@ -265,6 +271,9 @@ func (t T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, e
 	}
 
 	process := func(ms *stan.Msg) {
+		if sub.DurableName != "" {
+			ms.Ack()
+		}
 		for _, h := range h {
 			h(ms.Data)
 		}
@@ -278,6 +287,7 @@ func (t T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, e
 
 	if sub.DurableName != "" {
 		options = append(options, stan.DurableName(sub.DurableName))
+		options = append(options, stan.SetManualAckMode())
 	}
 
 	if sub.Sequence != 0 {
@@ -290,10 +300,7 @@ func (t T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, e
 		subHandler, err = t.connection.QueueSubscribe(subj, sub.QueueName, process, options...)
 	}
 
-	if err != nil {
-		return nil, err
-	}
-	return subHandler, nil
+	return subHandler, t.errorHandler(subj, err)
 }
 
 // NATS protocol conventions define subject names,
@@ -318,7 +325,7 @@ func (t T) safeSubject(s string) error {
 }
 
 // NATS protocol conventions does not allow subjects to have certain characters.
-// There is a need to allow ! in naming convensions (see WOW! provider) which is invalid for NATS
+// There is a need to allow ! in naming convensions which is invalid for NATS
 // this filter to parse characters out of subjects.
 func filterSubject(s string) string {
 	return strings.Replace(s, "!", "", -1)
@@ -326,17 +333,50 @@ func filterSubject(s string) string {
 
 // Encode allows for messages to be serialized for transmission via nats
 // Encode also AES-encrypts the message data for security
-func (t T) Encode(m *message.Msg) ([]byte, error) {
+func (t *T) Encode(m *message.Msg) ([]byte, error) {
 	b, err := m.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
-	return b, nil
+	return t.crypto.Encrypt(b)
 }
 
 // Decode allows messages to be de-serialized from the nats transmission
 // Decode also AES-descrypts the message data transmitted across the network
-func (t T) Decode(b []byte, p *message.Msg) error {
-	err := p.UnmarshalJSON(b)
+func (t *T) Decode(b []byte, p *message.Msg) error {
+	b, err := t.crypto.Decrypt(b)
+	if err != nil {
+		return err
+	}
+
+	err = p.UnmarshalJSON(b)
 	return err
+}
+
+// Close - closes the connection for nats-streaming
+func (t *T) Close() error {
+	return t.connection.Close()
+}
+
+func (t *T) errorHandler(subj string, err error) error {
+	if err == nil {
+		return nil
+	}
+	e := err.Error()
+	switch e {
+	case "stan: connection closed":
+		t.ClosedHandler(t)
+		return ErrConnectionClosed
+	case "stan: clientID already registered":
+		return ErrClientIDNotUnique
+	}
+	return fmt.Errorf("subject %s errored %v", subj, err)
+}
+
+// CloseHandler will close out subscription handlers when a request action is completed (these are typically one and done actions)
+func (t *T) CloseHandler(sHandlers ...stan.Subscription) {
+	for _, sHandler := range sHandlers {
+		sHandler.Unsubscribe()
+		sHandler.Close()
+	}
 }

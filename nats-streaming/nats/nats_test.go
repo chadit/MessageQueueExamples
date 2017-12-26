@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming"
-
 	message "github.com/chadit/MessageQueueExamples/nats-streaming/message"
 	nats1 "github.com/chadit/MessageQueueExamples/nats-streaming/nats"
 	"github.com/satori/uuid"
@@ -32,11 +30,21 @@ type mockProvider struct {
 var (
 	// instance is an instance of the cache that will be tested.
 	// Without it, each test would have to handle the creation of their own instance.
-	instance *nats1.T
-	clientID *string
+	instance  *nats1.T
+	clusterID *string
+	clientID  *string
+	urlList   *string
+	timeout   *time.Duration
+	crypto    *string
 )
 
 func init() {
+	clusterID = flag.String("cluster", "test-cluster", "The NATS Streaming cluster ID")
+	urlList = flag.String("nu", "nats://172.16.0.2:4222", "NATS URLs")
+	timeout = flag.Duration("nt", time.Second, "NATS timeout")
+	crypto = flag.String("nk", "A1B2c3D4e5F63c7u", "NATS crypto key")
+	flag.Parse()
+
 	cID := os.Args[0]
 	if i := strings.LastIndex(cID, "/"); i != -1 {
 		cID = strings.Replace(string(cID[i+1:]), ".", "_", -1)
@@ -44,14 +52,13 @@ func init() {
 	clientID = &cID
 
 	instance = &nats1.T{
-		ClusterID: flag.String("cluster", "test-cluster", "The NATS Streaming cluster ID"),
+		ClusterID: clusterID,
 		ClientID:  clientID,
-		URLList:   flag.String("nu", "nats://172.16.0.2:4222", "NATS URLs"),
-		Timeout:   flag.Duration("nt", time.Second, "NATS timeout"),
-		Crypto:    flag.String("nk", "A1B2c3D4e5F63c7u", "NATS crypto key"),
+		URLList:   urlList,
+		Timeout:   timeout,
+		Crypto:    crypto,
 	}
 
-	flag.Parse()
 	if err := instance.Initialize(); err != nil {
 		log.Fatalf("Error while creating nats connection: %v", err)
 	}
@@ -201,7 +208,7 @@ func TestSubscribe(t *testing.T) {
 		if n := atomic.LoadInt32(&notified); n != test.notified {
 			t.Fatalf("test %d notified %d handlers, not %d", index, n, test.notified)
 		}
-		closeSub(sub1, sub2, sub3, sub4)
+		instance.CloseHandler(sub1, sub2, sub3, sub4)
 	}
 }
 
@@ -262,10 +269,142 @@ func TestRequestForward(t *testing.T) {
 	}
 }
 
-func closeSub(sHandlers ...stan.Subscription) {
-	for _, sHandler := range sHandlers {
-		sHandler.Unsubscribe()
-		sHandler.Close()
+// func TestSafeSubject(t *testing.T) {
+// 	if testing.Short() {
+// 		t.Skip("Skipping integration test")
+// 	}
+
+// 	tests := []struct {
+// 		subj string
+// 		err  error
+// 	}{
+// 		{subj: ">", err: nil},
+// 		{subj: "foo", err: nil},
+// 		{subj: "foo.bar", err: nil},
+// 		{subj: "foo.bar.baz", err: nil},
+// 		{subj: "foo.>", err: nil},
+// 		{subj: "foo.*.baz", err: nil},
+// 		{subj: "foo.*.>", err: nil},
+// 		{subj: "foo.bar/baz.foo.foo-bar", err: nil},
+// 		{subj: "foo.bar/baz.(foo).foo-bar", err: nil},
+// 		{subj: "foo-bar", err: nil},
+// 		{subj: "-", err: nil},
+// 		{subj: "", err: nats1.ErrInvalidSubject},
+// 		{subj: " ", err: nats1.ErrInvalidSubject},
+// 		{subj: "_", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo.", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo..bar", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo bar", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo  bar", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo.**", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo.*bar", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo.*bar.", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo.*bar.>", err: nats1.ErrInvalidSubject},
+// 		{subj: "foo.bar>", err: nats1.ErrInvalidSubject},
+// 	}
+// 	m := message.Msg{
+// 		TransactionID: uuid.NewV4().String(),
+// 	}
+// 	for index, test := range tests {
+// 		m.Subject = test.subj
+// 		if err := instance.Publish(&m); err != nil {
+// 			if err != test.err {
+// 				t.Fatalf("Test %d produced error %v not %v", index, err, test.err)
+// 			}
+// 		}
+// 	}
+// }
+
+func TestClosedConnection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
 	}
 
+	td := time.Duration(time.Second * 30)
+	closeClientID := "close-test"
+	var isClosed bool
+	n := &nats1.T{
+		ClusterID: clusterID,
+		ClientID:  &closeClientID,
+		URLList:   urlList,
+		Timeout:   &td,
+		Crypto:    crypto,
+		ClosedHandler: func(t *nats1.T) {
+			isClosed = true
+		},
+	}
+	if err := n.Initialize(); err != nil {
+		t.Fatalf("Error during NATS setup: %v", err)
+	}
+	n.Close()
+	m := message.Msg{
+		Subject: uuid.NewV4().String(),
+	}
+
+	if _, err := n.Subscribe(nats1.Subscription{Subject: m.Subject}, func(m *message.Msg) {}); err != nats1.ErrConnectionClosed {
+		t.Fatalf("test produced subscribe error: %v", err)
+	}
+
+	if err := n.Publish(&m); err != nats1.ErrConnectionClosed {
+		t.Fatalf("test produced Publish error: %v", err)
+	}
+
+	<-time.After(time.Second / 4)
+	if !isClosed {
+		t.Fatal("Caller was not notified the connection is closed")
+	}
+}
+
+func TestDurability(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+
+	td := time.Duration(time.Second * 30)
+	closeClientID := "durability-test"
+	n := &nats1.T{
+		ClusterID: clusterID,
+		ClientID:  &closeClientID,
+		URLList:   urlList,
+		Timeout:   &td,
+		Crypto:    crypto,
+	}
+	if err := n.Initialize(); err != nil {
+		t.Fatalf("Error during NATS setup: %v", err)
+	}
+	var (
+		sub      = uuid.NewV4().String()
+		msgCount = 4
+		msgs     []*message.Msg
+	)
+
+	publishDoneCh := make(chan bool, 1)
+
+	sh, _ := n.Subscribe(nats1.Subscription{Subject: sub, DurableName: "test-dur"}, func(m *message.Msg) {
+		msgs = append(msgs, m)
+		<-publishDoneCh
+	})
+
+	for i := 0; i < msgCount; i++ {
+		m := message.Msg{Subject: sub, Text: fmt.Sprintf("message%d", i)}
+		if err := n.Publish(&m); err != nil {
+			t.Fatalf("test produced Publishing error: %v", err)
+		}
+	}
+
+	// simulate service going down while processing
+	sh.Close()
+	publishDoneCh <- true
+	// re-connect the subscription
+	sh2, _ := n.Subscribe(nats1.Subscription{Subject: sub, DurableName: "test-dur"}, func(m *message.Msg) {
+		msgs = append(msgs, m)
+	})
+
+	<-time.After(time.Second * 1)
+	if len(msgs) != msgCount {
+		t.Fatalf("test did not get back the expected message count, expected %d, but got %d", msgCount, len(msgs))
+
+	}
+
+	n.CloseHandler(sh, sh2)
 }
