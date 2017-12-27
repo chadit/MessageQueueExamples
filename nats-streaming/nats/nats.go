@@ -13,8 +13,7 @@ import (
 	message "github.com/chadit/MessageQueueExamples/nats-streaming/message"
 	crypto1 "github.com/chadit/MessageQueueExamples/nats-streaming/util/crypto"
 	stan "github.com/nats-io/go-nats-streaming"
-	bnats "github.com/nats-io/nats"
-	"github.com/satori/uuid"
+	uuid "github.com/satori/uuid"
 )
 
 // rawHandler is a function that expects to be called in response to stream response
@@ -37,8 +36,8 @@ var (
 	ErrClientIDNotUnique = errors.New("na: client id has already been registered")
 	// ErrNoHandler indicates a missing handler.
 	ErrNoHandler = errors.New("na: missing handler")
-	// ErrTimeout is an alias for nats.ErrTimeout.
-	ErrTimeout = bnats.ErrTimeout
+	// ErrTimeout is an alias for stan.ErrTimeout.
+	ErrTimeout = stan.ErrTimeout
 	// ErrInvalidSubject indicates that the subject invalid.
 	ErrInvalidSubject = errors.New("na: invalid subject")
 	// ErrRequestTimeout indicates that a request call timed out
@@ -124,6 +123,7 @@ func (t *T) Initialize() error {
 }
 
 // Request - serial calls - when the request is made, the thread will wait for a response or timeout
+// while nats supports this, nats-streaming does not support one and done subscriptions, this adds a layer to support it.
 func (t *T) Request(m, p *message.Msg) error {
 	if !t.initialized {
 		return ErrNotInitialized
@@ -207,11 +207,6 @@ func (t *T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription
 		return nil, ErrNoHandler
 	}
 
-	subj := filterSubject(sub.Subject)
-	if err := t.safeSubject(subj); err != nil {
-		return nil, err
-	}
-
 	process := func(ms *stan.Msg) {
 		if sub.DurableName != "" {
 			ms.Ack()
@@ -227,28 +222,7 @@ func (t *T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription
 		}
 	}
 
-	var (
-		err        error
-		subHandler stan.Subscription
-		options    []stan.SubscriptionOption
-	)
-
-	if sub.DurableName != "" {
-		options = append(options, stan.DurableName(sub.DurableName))
-		options = append(options, stan.SetManualAckMode())
-	}
-
-	if sub.Sequence != 0 {
-		options = append(options, stan.StartAtSequence(sub.Sequence))
-	}
-
-	if sub.QueueName == "" {
-		subHandler, err = t.connection.Subscribe(subj, process, options...)
-	} else {
-		subHandler, err = t.connection.QueueSubscribe(subj, sub.QueueName, process, options...)
-	}
-
-	return subHandler, t.errorHandler(subj, err)
+	return t.subscribe(sub, process)
 }
 
 // rawHandler registers a handler to be called in response to messages being received from the queue.
@@ -265,11 +239,6 @@ func (t *T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, 
 		return nil, ErrNoHandler
 	}
 
-	subj := filterSubject(sub.Subject)
-	if err := t.safeSubject(subj); err != nil {
-		return nil, err
-	}
-
 	process := func(ms *stan.Msg) {
 		if sub.DurableName != "" {
 			ms.Ack()
@@ -277,6 +246,16 @@ func (t *T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, 
 		for _, h := range h {
 			h(ms.Data)
 		}
+	}
+
+	return t.subscribe(sub, process)
+}
+
+func (t *T) subscribe(sub Subscription, p stan.MsgHandler) (stan.Subscription, error) {
+
+	subj := filterSubject(sub.Subject)
+	if err := t.safeSubject(subj); err != nil {
+		return nil, err
 	}
 
 	var (
@@ -295,9 +274,9 @@ func (t *T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, 
 	}
 
 	if sub.QueueName == "" {
-		subHandler, err = t.connection.Subscribe(subj, process, options...)
+		subHandler, err = t.connection.Subscribe(subj, p, options...)
 	} else {
-		subHandler, err = t.connection.QueueSubscribe(subj, sub.QueueName, process, options...)
+		subHandler, err = t.connection.QueueSubscribe(subj, sub.QueueName, p, options...)
 	}
 
 	return subHandler, t.errorHandler(subj, err)
