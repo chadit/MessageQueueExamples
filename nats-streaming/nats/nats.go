@@ -217,8 +217,8 @@ func (t *T) Subscribe(sub Subscription, h ...message.Handler) (stan.Subscription
 			m.Text = fmt.Sprintf("sub error decoding %s : %v", ms.Subject, err)
 		}
 
-		for _, h := range h {
-			h(m)
+		for i := range h {
+			h[i](m)
 		}
 	}
 
@@ -243,8 +243,8 @@ func (t *T) rawSubscribe(sub Subscription, h ...rawHandler) (stan.Subscription, 
 		if sub.DurableName != "" {
 			ms.Ack()
 		}
-		for _, h := range h {
-			h(ms.Data)
+		for i := range h {
+			h[i](ms.Data)
 		}
 	}
 

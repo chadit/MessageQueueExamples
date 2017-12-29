@@ -379,9 +379,10 @@ func TestDurability(t *testing.T) {
 	)
 
 	publishDoneCh := make(chan bool, 1)
+	msgItemsCh := make(chan *message.Msg, msgCount)
 
 	sh, _ := n.Subscribe(nats1.Subscription{Subject: sub, DurableName: "test-dur"}, func(m *message.Msg) {
-		msgs = append(msgs, m)
+		msgItemsCh <- m
 		<-publishDoneCh
 	})
 
@@ -397,11 +398,11 @@ func TestDurability(t *testing.T) {
 	publishDoneCh <- true
 	// re-connect the subscription
 	sh2, _ := n.Subscribe(nats1.Subscription{Subject: sub, DurableName: "test-dur"}, func(m *message.Msg) {
-		msgs = append(msgs, m)
+		msgItemsCh <- m
 	})
 
 	<-time.After(time.Second * 1)
-	if len(msgs) != msgCount {
+	if len(msgItemsCh) != msgCount {
 		t.Fatalf("test did not get back the expected message count, expected %d, but got %d", msgCount, len(msgs))
 
 	}
